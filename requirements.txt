@@ -1,6 +1,9 @@
 streamlit
 pandas
-scikit-learn
 joblib
-lightgbm
 plotly
+pyserial
+lightgbm
+scikit-learn
+matplotlib
+numpy
