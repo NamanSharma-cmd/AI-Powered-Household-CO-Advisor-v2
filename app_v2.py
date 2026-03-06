@@ -7,6 +7,7 @@ import plotly.express as px
 import time
 import os
 import joblib
+import base64
 
 # Import our refined predictor
 from predictor_v2 import get_prediction_and_recommendation
@@ -15,6 +16,8 @@ from predictor_v2 import get_prediction_and_recommendation
 DB_FILE = "emission_history_v2.db"
 LIVE_DATA_FILE = "live_data.csv"
 COMMAND_FILE = "command.txt"
+SCRUBBER_POWER_KW = 0.5  # Estimated power consumption of the scrubber system (kW)
+COST_PER_KWH = 0.15      # Estimated cost per kWh ($)
 
 # Appliance Map
 APPLIANCE_MAP = {
@@ -137,12 +140,31 @@ def create_custom_plotly_chart(df, title):
 def display_simulation_results(co2, rec, runtime, live_data, weather_data):
     """Helper to display consistent results across simulation scenarios."""
     # Metrics
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Predicted CO₂", f"{co2:.4f} kg")
     c2.metric("Scrubber Runtime", f"{runtime} min")
-    status = "High" if co2 > 0.05 else "Normal"
-    c3.metric("Risk Level", status, delta="Alert" if status=="High" else "Safe", delta_color="inverse")
     
+    # Cost Calculation
+    cost_usd = (runtime / 60) * SCRUBBER_POWER_KW * COST_PER_KWH
+    cost_inr = cost_usd * 83.0  # Approx exchange rate
+    
+    c3.metric("Est. Energy Cost", f"${cost_usd:.2f} / ₹{cost_inr:.2f}")
+
+    status = "High" if co2 > 0.05 else "Normal"
+    c4.metric("Risk Level", status, delta="Alert" if status=="High" else "Safe", delta_color="inverse")
+    
+    # Audio Alert for High Emissions
+    if status == "High":
+        # Short beep (100ms sine wave 440Hz) - WAV Base64
+        beep_b64 = "UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVAb3R5k6+smGU2NUBvdHmTr6yYZTY1QG90eZOvrJhlNjVAb3R5k6+smGU2NUBvdHmTr6yYZTY1QG90eZOvrJhlNjVA"
+        
+        audio_html = f"""
+            <audio autoplay>
+            <source src="data:audio/wav;base64,{beep_b64}" type="audio/wav">
+            </audio>
+        """
+        st.markdown(audio_html, unsafe_allow_html=True)
+
     # Recommendation
     if co2 > 0.05:
         st.error(f"**Recommendation:** {rec}")
@@ -193,6 +215,162 @@ def display_simulation_results(co2, rec, runtime, live_data, weather_data):
         fig_proj = px.area(df_proj, x='Time (min)', y='Remaining CO₂ (kg)', markers=True)
         fig_proj.add_vline(x=runtime, line_dash="dash", line_color="green", annotation_text="Target Reached")
         st.plotly_chart(fig_proj, use_container_width=True)
+
+    # PDF Report Generation
+    if st.button("📄 Generate PDF Report"):
+        try:
+            from fpdf import FPDF
+            import tempfile
+            
+            # Helper for text cleaning
+            def clean_text(text):
+                text = str(text).replace("°", " deg").replace("₹", "INR ")
+                return text.encode('ascii', 'ignore').decode('ascii')
+
+            # Create PDF object
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            epw = pdf.epw
+            
+            # --- Title ---
+            pdf.set_font("Arial", 'B', 16)
+            pdf.cell(epw, 10, txt=clean_text("CO2 Scrubber Simulation Report"), ln=True, align='C')
+            pdf.ln(5)
+            
+            # --- Date & Summary ---
+            pdf.set_font("Arial", size=10)
+            pdf.cell(epw, 8, txt=clean_text(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"), ln=True, align='C')
+            pdf.ln(5)
+
+            # Summary Box
+            pdf.set_fill_color(240, 240, 240)
+            pdf.rect(x=10, y=pdf.get_y(), w=epw, h=30, style='F')
+            
+            pdf.set_font("Arial", 'B', 12)
+            start_y = pdf.get_y() + 5
+            pdf.set_xy(15, start_y)
+            pdf.cell(90, 10, txt=clean_text(f"Predicted CO2: {co2:.4f} kg"))
+            pdf.cell(90, 10, txt=clean_text(f"Risk Level: {status}"), ln=True)
+            
+            pdf.set_xy(15, start_y + 10)
+            pdf.cell(90, 10, txt=clean_text(f"Runtime: {runtime} min"))
+            pdf.cell(90, 10, txt=clean_text(f"Est. Cost: ${cost_usd:.2f} / INR {cost_inr:.2f}"), ln=True)
+            pdf.ln(20)
+
+            # --- Charts Section ---
+            pdf.set_font("Arial", 'B', 14)
+            pdf.cell(epw, 10, txt=clean_text("Visual Analysis"), ln=True)
+            pdf.ln(2)
+            
+            # Generate and Save Charts
+            chart_y = pdf.get_y()
+            gauge_path = None
+            pie_path = None
+            proj_path = None
+            
+            # 1. Gauge Chart
+            fig_gauge_static = go.Figure(go.Indicator(
+                mode = "gauge+number", value = co2,
+                title = {'text': "CO2 Level"},
+                gauge = {
+                    'axis': {'range': [0, max(0.1, co2 * 1.5)]},
+                    'bar': {'color': "black"},
+                    'steps': [{'range': [0, 0.05], 'color': "lightgreen"}, {'range': [0.05, 1.0], 'color': "salmon"}],
+                    'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 0.05}
+                }))
+            fig_gauge_static.update_layout(width=400, height=300, margin=dict(l=20, r=20, t=50, b=20))
+            
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_gauge:
+                fig_gauge_static.write_image(tmp_gauge.name)
+                pdf.image(tmp_gauge.name, x=10, y=chart_y, w=90)
+                gauge_path = tmp_gauge.name
+
+            # 2. Pie Chart (if appliances exist)
+            active_apps = {k: v for k, v in live_data.items() if v > 0}
+            if active_apps:
+                df_apps = pd.DataFrame(list(active_apps.items()), columns=['Appliance', 'Watts'])
+                fig_pie_static = px.pie(df_apps, values='Watts', names='Appliance', title="Power Breakdown")
+                fig_pie_static.update_layout(width=400, height=300, margin=dict(l=20, r=20, t=50, b=20))
+                
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_pie:
+                    fig_pie_static.write_image(tmp_pie.name)
+                    pdf.image(tmp_pie.name, x=110, y=chart_y, w=90)
+                    pie_path = tmp_pie.name
+            
+            pdf.ln(90) # Move past charts
+
+            # --- Recommendation ---
+            pdf.set_font("Arial", 'B', 14)
+            pdf.cell(epw, 10, txt=clean_text("AI Recommendation"), ln=True)
+            pdf.set_font("Arial", size=11)
+            pdf.multi_cell(epw, 6, txt=clean_text(rec))
+            pdf.ln(5)
+
+            # --- Details Table ---
+            pdf.set_font("Arial", 'B', 14)
+            pdf.cell(epw, 10, txt=clean_text("Simulation Details"), ln=True)
+            pdf.ln(2)
+            
+            # Weather
+            pdf.set_font("Arial", 'B', 11)
+            pdf.cell(epw, 8, txt=clean_text("Weather Conditions:"), ln=True)
+            pdf.set_font("Arial", size=11)
+            weather_txt = ", ".join([f"{k}: {v}" for k, v in weather_data.items()])
+            pdf.multi_cell(epw, 6, txt=clean_text(weather_txt))
+            pdf.ln(5)
+            
+            # Appliances List
+            pdf.set_font("Arial", 'B', 11)
+            pdf.cell(epw, 8, txt=clean_text("Active Appliances:"), ln=True)
+            pdf.set_font("Arial", size=10)
+            
+            if active_apps:
+                # Simple table header
+                pdf.set_fill_color(220, 220, 220)
+                pdf.cell(100, 8, "Appliance", 1, 0, 'L', 1)
+                pdf.cell(40, 8, "Power (W)", 1, 1, 'L', 1)
+                
+                for app, watts in active_apps.items():
+                    pdf.cell(100, 8, clean_text(app), 1)
+                    pdf.cell(40, 8, str(watts), 1, 1)
+            else:
+                pdf.cell(epw, 8, "No active appliances.", ln=True)
+            
+            pdf.ln(10)
+
+            # --- Projection Chart (if applicable) ---
+            if runtime > 0:
+                pdf.add_page() # New page for projection if needed
+                pdf.set_font("Arial", 'B', 14)
+                pdf.cell(epw, 10, txt=clean_text("Projected Reduction"), ln=True)
+                
+                # Re-create projection chart
+                minutes = list(range(0, runtime + 10, 5))
+                values = [max(0, co2 - (co2 / runtime * m)) for m in minutes]
+                df_proj = pd.DataFrame({'Time (min)': minutes, 'Remaining CO2 (kg)': values})
+                fig_proj_static = px.area(df_proj, x='Time (min)', y='Remaining CO2 (kg)', title="CO2 Reduction Over Time")
+                fig_proj_static.add_vline(x=runtime, line_dash="dash", line_color="green")
+                fig_proj_static.update_layout(width=800, height=400)
+                
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_proj:
+                    fig_proj_static.write_image(tmp_proj.name)
+                    pdf.image(tmp_proj.name, x=10, y=pdf.get_y() + 10, w=180)
+                    proj_path = tmp_proj.name
+
+            # Output PDF
+            pdf_bytes = pdf.output()
+            b64_pdf = base64.b64encode(pdf_bytes).decode('latin-1')
+            href = f'<a href="data:application/pdf;base64,{b64_pdf}" download="simulation_report.pdf" style="text-decoration:none; color:white; background-color:#FF4B4B; padding:10px 20px; border-radius:5px; font-weight:bold;">Download PDF Report</a>'
+            st.markdown(href, unsafe_allow_html=True)
+            
+            # Cleanup
+            if gauge_path and os.path.exists(gauge_path): os.remove(gauge_path)
+            if pie_path and os.path.exists(pie_path): os.remove(pie_path)
+            if proj_path and os.path.exists(proj_path): os.remove(proj_path)
+
+        except Exception as e:
+            st.error(f"Failed to generate PDF: {e}")
 
 # --- Page Config ---
 st.set_page_config(
@@ -571,26 +749,46 @@ elif page == "Live Monitor":
             if os.path.exists(LIVE_DATA_FILE):
                 try:
                     # Read last 50 lines efficiently
-                    df = pd.read_csv(LIVE_DATA_FILE)
+                    try:
+                        df = pd.read_csv(LIVE_DATA_FILE, on_bad_lines='skip')
+                    except TypeError:
+                        # Fallback for older pandas versions
+                        df = pd.read_csv(LIVE_DATA_FILE, error_bad_lines=False)
+                        
                     if not df.empty:
                         last_50 = df.tail(50)
                         latest = df.iloc[-1]
                         
                         # Metrics
-                        m1, m2, m3 = st.columns(3)
+                        m1, m2, m3, m4 = st.columns(4)
                         m1.metric("Air Quality (Raw)", int(latest['sensor_value']))
                         m2.metric("Voltage", f"{float(latest['voltage']):.2f} V")
                         
-                        status = "NORMAL"
-                        if int(latest['sensor_value']) > 1000:
-                            status = "HIGH"
-                            m3.error(f"Status: {status}")
+                        # Hardware Status Feedback
+                        if 'relay_state' in latest:
+                            hw_state = "ON" if int(latest['relay_state']) == 1 else "OFF"
+                            m4.metric("Hardware Status", hw_state, delta="Active" if hw_state=="ON" else "Idle")
                         else:
-                            m3.success(f"Status: {status}")
+                            m4.metric("Hardware Status", "Unknown", help="Update bridge.py for feedback")
+
+                        # Sensor Health Check
+                        last_update = pd.to_datetime(latest['timestamp'])
+                        time_diff = (datetime.now() - last_update).total_seconds()
+                        
+                        if time_diff > 30:
+                            m3.error(f"🔴 SENSOR OFFLINE ({int(time_diff)}s ago)")
+                        else:
+                            status = "NORMAL"
+                            if int(latest['sensor_value']) > 1000:
+                                status = "HIGH"
+                                m3.error(f"Air Status: {status}")
+                            else:
+                                m3.success(f"Air Status: {status}")
                         
                         # Chart
                         fig = px.line(last_50, x='timestamp', y='sensor_value', title="Real-Time Sensor Readings")
                         st.plotly_chart(fig, use_container_width=True)
+                        st.caption(f"Last Data Update: {latest['timestamp']}")
                     else:
                         st.warning("Data file is empty.")
                 except Exception as e:
@@ -598,111 +796,126 @@ elif page == "Live Monitor":
             else:
                 st.warning("Waiting for data... (File not found)")
             
+            # Auto-refresh loop
+            time.sleep(1)
+            try:
+                st.rerun()
+            except AttributeError:
+                st.experimental_rerun()
+            
 # 6. SIMULATION / DEMO PAGE
 elif page == "Simulation / Demo":
     st.title("🧪 System Simulation & Demonstration")
-    st.markdown("Use these preset test cases to demonstrate the system's response to different conditions.")
+    st.markdown("Select a scenario to demonstrate the system's response to different conditions.")
     
-    # Tabs for different scenarios
-    tab1, tab2, tab3 = st.tabs(["✅ Normal Scenario", "⚠️ Abnormal Scenario", "🛠️ Custom Test Case"])
+    # Scenario Selector
+    scenario = st.selectbox("Select Scenario", 
+                            ["✅ Normal (Mild Weather)", 
+                             "⚠️ Abnormal (Cold/High Load)", 
+                             "🍽️ Dinner Party", 
+                             "❄️ Winter Night", 
+                             "✈️ Vacation Mode", 
+                             "🛠️ Custom Test Case"])
     
-    # --- Normal Test Case ---
-    with tab1:
-        st.subheader("Scenario: Mild Weather, Low Usage")
+    # Clear results if scenario changes
+    if 'last_scenario' not in st.session_state:
+        st.session_state['last_scenario'] = scenario
+    
+    if st.session_state['last_scenario'] != scenario:
+        if 'sim_results' in st.session_state:
+            del st.session_state['sim_results']
+        st.session_state['last_scenario'] = scenario
+    
+    # Initialize Params
+    sim_weather = {}
+    sim_appliances = {}
+    
+    # Define Scenarios
+    if scenario == "✅ Normal (Mild Weather)":
         st.info("Simulates a typical day with low appliance usage and mild weather.")
+        sim_weather = {'max_temp_°c': 20, 'humidity_%': 50, 'rain_mm': 0}
+        sim_appliances = {'Fridge': 100, 'Router': 10, 'Television': 80}
         
-        # Define Params
-        normal_weather = {'max_temp_°c': 20, 'humidity_%': 50, 'rain_mm': 0}
-        normal_appliances = {'Fridge': 100, 'Router': 10, 'Television': 80}
-        
-        # Display Params
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Weather Parameters:**")
-            st.json(normal_weather)
-        with c2:
-            st.markdown("**Appliance Usage (Watts):**")
-            st.json(normal_appliances)
-            
-        if st.button("Run Normal Test", use_container_width=True):
-            co2, rec, runtime = get_prediction_and_recommendation(normal_appliances, normal_weather, 1)
-            
-            st.markdown("---")
-            st.subheader("Test Results")
-            display_simulation_results(co2, rec, runtime, normal_appliances, normal_weather)
-            
-            # Ensure scrubber is OFF
-            with open(COMMAND_FILE, "w") as f:
-                f.write("0")
-            st.toast("System Status: IDLE")
-
-    # --- Abnormal Test Case ---
-    with tab2:
-        st.subheader("Scenario: Cold Weather, High Load")
+    elif scenario == "⚠️ Abnormal (Cold/High Load)":
         st.error("Simulates high load (heating + heavy appliances) in cold weather.")
+        sim_weather = {'max_temp_°c': -2, 'humidity_%': 85, 'rain_mm': 5}
+        sim_appliances = {'Electric_Heater': 2500, 'Tumble_Dryer': 2000, 'Washing_Machine': 1500, 'Fridge': 150}
         
-        # Define Params
-        abnormal_weather = {'max_temp_°c': -2, 'humidity_%': 85, 'rain_mm': 5}
-        abnormal_appliances = {
-            'Electric_Heater': 2500, 
-            'Tumble_Dryer': 2000, 
-            'Washing_Machine': 1500,
-            'Fridge': 150
-        }
-        
-        # Display Params
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Weather Parameters:**")
-            st.json(abnormal_weather)
-        with c2:
-            st.markdown("**Appliance Usage (Watts):**")
-            st.json(abnormal_appliances)
-            
-        if st.button("Run Abnormal Test", type="primary", use_container_width=True):
-            co2, rec, runtime = get_prediction_and_recommendation(abnormal_appliances, abnormal_weather, 1)
-            
-            st.markdown("---")
-            st.subheader("Test Results")
-            display_simulation_results(co2, rec, runtime, abnormal_appliances, abnormal_weather)
-            
-            # Trigger Scrubber
-            with open(COMMAND_FILE, "w") as f:
-                f.write("1")
-            st.toast("🚨 SCRUBBER ACTIVATED!", icon="⚠️")
+    elif scenario == "🍽️ Dinner Party":
+        st.info("High cooking load, dishwasher, and entertainment.")
+        sim_weather = {'max_temp_°c': 18, 'humidity_%': 60, 'rain_mm': 0}
+        sim_appliances = {'Electric_Heater': 1000, 'Dishwasher': 1200, 'Microwave': 800, 'Television': 150, 'Fridge': 150, 'Hi-Fi': 100}
 
-    # --- Custom Test Case ---
-    with tab3:
-        st.subheader("Scenario: Custom User Input")
-        st.markdown("Define your own parameters to test the system.")
-        
+    elif scenario == "❄️ Winter Night":
+        st.info("Very cold night, heavy heating usage.")
+        sim_weather = {'max_temp_°c': -5, 'humidity_%': 40, 'rain_mm': 0}
+        sim_appliances = {'Electric_Heater': 3000, 'Television': 100, 'Fridge': 100, 'Kettle': 2000, 'Router': 10}
+
+    elif scenario == "✈️ Vacation Mode":
+        st.success("Minimal usage, only essential appliances.")
+        sim_weather = {'max_temp_°c': 15, 'humidity_%': 50, 'rain_mm': 0}
+        sim_appliances = {'Fridge': 80, 'Router': 10}
+
+    elif scenario == "🛠️ Custom Test Case":
+        st.markdown("Define your own parameters.")
         c_input, c_weather = st.columns(2)
-        
         with c_weather:
             st.markdown("#### Weather")
             cust_temp = st.slider("Temperature (°C)", -10, 40, 10, key="cust_temp")
             cust_hum = st.slider("Humidity (%)", 0, 100, 50, key="cust_hum")
             cust_rain = st.slider("Rainfall (mm)", 0, 10, 0, key="cust_rain")
-            
         with c_input:
             st.markdown("#### Appliances")
-            # Simplified list for custom test
             cust_heater = st.slider("Electric Heater (W)", 0, 3000, 0, key="cust_heater")
             cust_washer = st.slider("Washing Machine (W)", 0, 3000, 0, key="cust_washer")
             cust_dryer = st.slider("Tumble Dryer (W)", 0, 3000, 0, key="cust_dryer")
             cust_fridge = st.slider("Fridge (W)", 0, 500, 100, key="cust_fridge")
             
-        if st.button("Run Custom Test", use_container_width=True):
-            cust_weather = {'max_temp_°c': cust_temp, 'humidity_%': cust_hum, 'rain_mm': cust_rain}
-            cust_appliances = {
-                'Electric_Heater': cust_heater,
-                'Washing_Machine': cust_washer,
-                'Tumble_Dryer': cust_dryer,
-                'Fridge': cust_fridge
-            }
-            
-            co2, rec, runtime = get_prediction_and_recommendation(cust_appliances, cust_weather, 1)
-            
-            st.markdown("---")
-            st.subheader("Test Results")
-            display_simulation_results(co2, rec, runtime, cust_appliances, cust_weather)
+        sim_weather = {'max_temp_°c': cust_temp, 'humidity_%': cust_hum, 'rain_mm': cust_rain}
+        sim_appliances = {
+            'Electric_Heater': cust_heater,
+            'Washing_Machine': cust_washer,
+            'Tumble_Dryer': cust_dryer,
+            'Fridge': cust_fridge
+        }
+
+    # Display Parameters (if not custom, as custom already shows sliders)
+    if scenario != "🛠️ Custom Test Case":
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Weather Parameters:**")
+            st.json(sim_weather)
+        with c2:
+            st.markdown("**Appliance Usage (Watts):**")
+            st.json(sim_appliances)
+
+    # Run Simulation Button
+    if st.button("Run Simulation", type="primary" if "Abnormal" in scenario else "secondary", use_container_width=True):
+        co2, rec, runtime = get_prediction_and_recommendation(sim_appliances, sim_weather, 1)
+        
+        # Store results in session state
+        st.session_state['sim_results'] = {
+            'co2': co2,
+            'rec': rec,
+            'runtime': runtime,
+            'sim_appliances': sim_appliances,
+            'sim_weather': sim_weather
+        }
+        
+        # Scrubber Control Logic Simulation
+        if co2 > 0.05:
+            with open(COMMAND_FILE, "w") as f:
+                f.write("1")
+            st.toast("🚨 SCRUBBER ACTIVATED!", icon="⚠️")
+        else:
+            with open(COMMAND_FILE, "w") as f:
+                f.write("0")
+            st.toast("System Status: IDLE")
+
+    # Display Results if available
+    if 'sim_results' in st.session_state:
+        res = st.session_state['sim_results']
+        
+        st.markdown("---")
+        st.subheader("Test Results")
+        display_simulation_results(res['co2'], res['rec'], res['runtime'], res['sim_appliances'], res['sim_weather'])
